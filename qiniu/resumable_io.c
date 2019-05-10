@@ -125,6 +125,14 @@ static Qiniu_Rio_ThreadModel_Itbl Qiniu_Rio_ST_Itbl = {
         Qiniu_Rio_ST_RunTask
 };
 
+static Qiniu_Error ErrPutFailed = {
+        Qiniu_Rio_PutFailed, "resumable put failed"
+};
+static Qiniu_Error ErrPutInterrupted = {
+        Qiniu_Rio_PutInterrupted, "resumable put interrupted"
+};
+
+
 Qiniu_Rio_ThreadModel Qiniu_Rio_ST = {
         NULL, &Qiniu_Rio_ST_Itbl
 };
@@ -392,7 +400,6 @@ static Qiniu_Error Qiniu_Rio_ResumableBlockput(
     int notifyRet = 0;
 
     if (ret->ctx == NULL) {
-
         if (chunkSize < blkSize) {
             bodyLength = chunkSize;
         } else {
@@ -406,7 +413,8 @@ static Qiniu_Error Qiniu_Rio_ResumableBlockput(
         if (err.code != 200) {
             return err;
         }
-        if (ret->crc32 != crc32.val || (int) (ret->offset) != bodyLength) {
+        // if (ret->crc32 != crc32.val || (int) (ret->offset) != bodyLength) {
+        if (1==1) {
             return ErrUnmatchedChecksum;
         }
         notifyRet = extra->notify(extra->notifyRecvr, blkIdx, blkSize, ret);
@@ -417,7 +425,6 @@ static Qiniu_Error Qiniu_Rio_ResumableBlockput(
             return err;
         }
     }
-
     while ((int) (ret->offset) < blkSize) {
 
         if (chunkSize < blkSize - (int) (ret->offset)) {
@@ -432,7 +439,6 @@ static Qiniu_Error Qiniu_Rio_ResumableBlockput(
         crc32.val = 0;
         body1 = Qiniu_SectionReader(&section, f, (Qiniu_Off_T) offbase + (ret->offset), bodyLength);
         body = Qiniu_TeeReader(&tee, body1, h);
-
         err = Qiniu_Rio_Blockput(c, ret, body, bodyLength);
         if (err.code == 200) {
             if (ret->crc32 == crc32.val) {
@@ -540,10 +546,17 @@ typedef struct _Qiniu_Rio_task {
     int blkSize1;
 } Qiniu_Rio_task;
 
+typedef struct _T_Qiniu_Rio_task {
+    Qiniu_Rio_task *task;
+    Qiniu_Error *err;
+} T_Qiniu_Rio_task;
+
 static void Qiniu_Rio_doTask(void *params) {
     Qiniu_Error err;
     Qiniu_Rio_BlkputRet ret;
-    Qiniu_Rio_task *task = (Qiniu_Rio_task *) params;
+    T_Qiniu_Rio_task *t_task = (T_Qiniu_Rio_task *) params;
+    Qiniu_Rio_task *task = t_task->task;
+    t_task->err = &err;
     Qiniu_Rio_WaitGroup wg = task->wg;
     Qiniu_Rio_PutExtra *extra = task->extra;
     Qiniu_Rio_ThreadModel tm = extra->threadModel;
@@ -555,6 +568,8 @@ static void Qiniu_Rio_doTask(void *params) {
         free(task);
         Qiniu_Count_Inc(task->ninterrupts);
         wg.itbl->Done(wg.self);
+        err = ErrPutInterrupted;
+        t_task->err = &err;
         return;
     }
 
@@ -563,6 +578,7 @@ static void Qiniu_Rio_doTask(void *params) {
     lzRetry:
     Qiniu_Rio_BlkputRet_Assign(&ret, &extra->progresses[blkIdx]);
     err = Qiniu_Rio_ResumableBlockput(c, &ret, task->f, blkIdx, task->blkSize1, extra);
+    t_task->err = &err;
     if (err.code != 200) {
         if (err.code == Qiniu_Rio_PutInterrupted) {
             // Terminate the upload process if the caller requests
@@ -592,18 +608,12 @@ static void Qiniu_Rio_doTask(void *params) {
 /*============================================================================*/
 /* func Qiniu_Rio_PutXXX */
 
-static Qiniu_Error ErrPutFailed = {
-        Qiniu_Rio_PutFailed, "resumable put failed"
-};
-static Qiniu_Error ErrPutInterrupted = {
-        Qiniu_Rio_PutInterrupted, "resumable put interrupted"
-};
-
 Qiniu_Error Qiniu_Rio_Put(
         Qiniu_Client *self, Qiniu_Rio_PutRet *ret,
         const char *uptoken, const char *key, Qiniu_ReaderAt f, Qiniu_Int64 fsize, Qiniu_Rio_PutExtra *extra1) {
     Qiniu_Int64 offbase;
     Qiniu_Rio_task *task;
+    T_Qiniu_Rio_task *t_task;
     Qiniu_Rio_WaitGroup wg;
     Qiniu_Rio_PutExtra extra;
     Qiniu_Rio_ThreadModel tm;
@@ -642,8 +652,11 @@ Qiniu_Error Qiniu_Rio_Put(
             task->blkSize1 = (int) (fsize - offbase);
         }
 
+        t_task = (T_Qiniu_Rio_task *)malloc(sizeof(T_Qiniu_Rio_task));
+        t_task->task = task;
+
         wg.itbl->Add(wg.self, 1);
-        retCode = tm.itbl->RunTask(tm.self, Qiniu_Rio_doTask, task);
+        retCode = tm.itbl->RunTask(tm.self, Qiniu_Rio_doTask, t_task);
         if (retCode == QINIU_RIO_NOTIFY_EXIT) {
             wg.itbl->Done(wg.self);
             Qiniu_Count_Inc(&ninterrupts);
@@ -653,24 +666,39 @@ Qiniu_Error Qiniu_Rio_Put(
         if (ninterrupts > 0) {
             break;
         }
+        if (nfails > 0) {
+            break;
+        }
     } // for
 
+// ErrUnmatchedChecksum
     wg.itbl->Wait(wg.self);
-    if (nfails != 0) {
-        err = ErrPutFailed;
-    } else if (ninterrupts != 0) {
-        err = ErrPutInterrupted;
+    if (t_task->err != NULL && (*t_task->err).code != 200) {
+        Qiniu_Error o_err = *t_task->err;
+        // len("resumable put failed:  code: %s, msg: %s") == 40
+        int s = 40 + 16 + strlen((o_err.message));
+        char msg[s];
+        // memset(msg, 0, s);
+        sprintf(msg, "resumable put failed:  code: %d, msg: %s", o_err.code, o_err.message);
+        err.code = Qiniu_Rio_PutFailed;
+        err.message = msg;
+        free(t_task);
+        printf("1 ---- %p  %d: %s\n", &err, err.code, err.message);
     } else {
+        free(t_task);
         err = Qiniu_Rio_Mkfile(self, ret, key, fsize, &extra);
+        printf("11 ---- %p  %d: %s\n", &err, err.code, err.message);
     }
-
+    printf("12 ---- %p  %d: %s\n", &err, err.code, err.message);
     Qiniu_Rio_PutExtra_Cleanup(&extra);
 
     wg.itbl->Release(wg.self);
     auth.itbl->Release(auth.self);
     self->auth = auth1;
+    printf("13 ---- %p  %d: %s\n", &err, err.code, err.message);
     return err;
 }
+
 
 Qiniu_Error Qiniu_Rio_PutFile(
         Qiniu_Client *self, Qiniu_Rio_PutRet *ret,
@@ -695,8 +723,10 @@ Qiniu_Error Qiniu_Rio_PutFile(
             return Qiniu_Io_PutFile(self, ret, uptoken, key, localFile, &extra1);
         }
         err = Qiniu_Rio_Put(self, ret, uptoken, key, Qiniu_FileReaderAt(f), fsize, extra);
+        printf("3 ---- %p  %d: %s\n", &err, err.code, err.message);
     }
     Qiniu_File_Close(f);
+    printf("2 ---- %p  %d: %s\n", &err, err.code, err.message);
     return err;
 }
 
